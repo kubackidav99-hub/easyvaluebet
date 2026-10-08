@@ -1,0 +1,72 @@
+// Checks the financial calculation and the boundaries that prevent false signals.
+const ts=require('typescript');const fs=require('node:fs');const os=require('node:os');const path=require('node:path');const assert=require('node:assert/strict');
+const target=fs.mkdtempSync(path.join(os.tmpdir(),'easybet-check-'));
+for(const name of ['protocol','radar'])fs.writeFileSync(path.join(target,name+'.js'),ts.transpileModule(fs.readFileSync(path.join(__dirname,'../lib/'+name+'.ts'),'utf8'),{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText);
+const {fairProbabilities,expectedValue,matchEvent,compareMarkets,inventory,scan}=require(path.join(target,'radar.js'));
+assert.deepEqual(fairProbabilities([1.91,1.91]),[.5,.5]);assert(Math.abs(expectedValue(.5,2.1)-5)<1e-9);assert(expectedValue(.5,2.1,.12)<0);assert.deepEqual(fairProbabilities([1]),[]);
+const date=new Date(Date.now()+86400000).toISOString();
+const b={id:123,name:'A - B',date,competition:'Test',teams:['A','B'],markets:[{name:'Zwycięzca meczu',suspended:false,selections:[{name:'A',odds:2.1},{name:'B',odds:1.7}]}]};
+const p={id:456,startTime:date,isLive:false,participants:[{id:1,name:'B',alignment:'away'},{id:2,name:'A',alignment:'home'}],league:{name:'Test'}};
+const market={matchupId:456,type:'moneyline',period:0,key:'s;0;m',cutoffAt:date,prices:[{designation:'away',price:-110},{designation:'home',price:-110}]};
+assert.equal(matchEvent(b,[p]).id,456);assert.equal(matchEvent(b,[p,p]),undefined);assert.equal(matchEvent({...b,date:new Date(Date.now()-10000).toISOString()},[p]),undefined);
+const rows=compareMarkets(b,p,[market],'basketball',Date.now());assert.equal(rows.length,1);assert.equal(rows[0].pick,'A');assert(Math.abs(rows[0].ev-5)<1e-9);
+assert.equal(compareMarkets(b,p,[{...market,period:1}],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(b,p,[market],'basketball',Date.now()-360000).length,0);
+assert.equal(compareMarkets({...b,markets:[{...b.markets[0],suspended:true}]},p,[market],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets({...b,markets:[{...b.markets[0],name:'Zwycięzca pierwszej kwarty'}]},p,[market],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(b,{...p,participants:[{id:1,name:'C',alignment:'away'},{id:2,name:'D',alignment:'home'}]},[market],'basketball',Date.now()).length,0);
+// Exact line and period matching: use distinct odds so swapped sides are observable.
+const total=(line,period=0,id=456)=>({...market,matchupId:id,type:'total',period,key:`s;${period};ou;${line}`,prices:[{designation:'under',points:line,price:-110},{designation:'over',points:line,price:-110}]});
+const bet=(name,sels)=>({...b,markets:[{name,suspended:false,selections:sels}]});
+const ou=(line)=>[{name:`Powyżej ${String(line).replace('.',',')}`,odds:2.1},{name:`Poniżej ${String(line).replace('.',',')}`,odds:1.7}];
+let bt=bet('Suma punktów',ou(165.5));
+assert.equal(compareMarkets(bt,p,[total(165.5)],'basketball',Date.now())[0].pick,'Powyżej 165,5');
+assert.equal(compareMarkets(bt,p,[total(164.5)],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(bt,p,[total(165.5,1)],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(bt,p,[total(165.5),total(165.5)],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(bet('Suma punktów',ou(165)),p,[total(165)],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(bet('Gole Powyżej/Poniżej',ou(2.25)),p,[total(2.25)],'football',Date.now()).length,0);
+assert.equal(compareMarkets(bet('Suma punktów - Pierwsza Połowa',ou(80.5)),p,[total(80.5,1)],'basketball',Date.now()).length,1);
+assert.equal(compareMarkets(bet('Suma punktów - Pierwsza Kwarta',ou(40.5)),p,[total(40.5,3)],'basketball',Date.now()).length,1);
+assert.equal(compareMarkets(bet('Suma punktów - Pierwsza Kwarta',ou(40.5)),p,[total(40.5,4)],'basketball',Date.now()).length,0);
+// Handicap signs belong to the named participant, independently of home/away list order.
+const spread={...market,type:'spread',key:'s;0;s;-3.5',prices:[{designation:'away',points:3.5,price:-110},{designation:'home',points:-3.5,price:-110}]};
+const bh=bet('Wynik handicap',[{name:'A (-3,5)',odds:2.1},{name:'B +3.5',odds:1.7}]);
+assert.equal(compareMarkets(bh,p,[spread],'basketball',Date.now())[0].pick,'A (-3,5)');
+assert.equal(compareMarkets(bh,p,[{...spread,prices:spread.prices.map(x=>({...x,points:-x.points}))}],'basketball',Date.now()).length,0);
+const tt={...total(80.5),type:'team_total',side:'home',key:'s;0;tt;80.5;home'};
+assert.equal(compareMarkets(bet('A Suma punktów',ou(80.5)),p,[tt],'basketball',Date.now()).length,1);
+assert.equal(compareMarkets(bet('B Suma punktów',ou(80.5)),p,[tt],'basketball',Date.now()).length,0);
+// A linked corners child is the only valid reference for a corners total.
+const child={...p,id:777,parentId:p.id,units:'Corners',participants:p.participants.map(x=>({...x,name:x.name+' (Corners)'}))};
+const bc=bet('Liczba rzutów rożnych - 1. połowa',ou(4.5));
+assert.equal(compareMarkets(bc,p,[total(4.5,1)],'football',Date.now(),[p]).length,0);
+assert.equal(compareMarkets(bc,p,[total(4.5,1,777)],'football',Date.now(),[p,child]).length,1);
+assert.equal(compareMarkets(bc,p,[total(4.5,0,777)],'football',Date.now(),[p,child]).length,0);
+assert.equal(compareMarkets(bc,p,[total(4.5,1,777)],'football',Date.now(),[p,{...child,parentId:999}]).length,0);
+assert.equal(compareMarkets(bet('Liczba rzutów rożnych - 1. połowa',ou(.5)),p,[total(4.5,1,777)],'football',Date.now(),[p,child]).length,0);
+const fc=bet('Handicap (2-drożny)',[{name:'A (-3,5)',odds:2.1},{name:'B (+3.5)',odds:1.7}]);
+assert.equal(compareMarkets(fc,p,[spread],'football',Date.now(),[child])[0].kind,'handicap');
+assert.equal(compareMarkets(fc,p,[{...spread,matchupId:777}],'football',Date.now(),[child]).length,0);
+assert.equal(compareMarkets(bet('Rzuty rożne',ou(9.5)),p,[total(9.5,0,777)],'football',Date.now(),[child]).length,1);
+assert.equal(compareMarkets(bet('1. kw. - Suma punktów',ou(40.5)),p,[total(40.5,3)],'basketball',Date.now()).length,1);
+// Tennis games cannot be compared with sets even if the line is numerically equal.
+const games={...child,units:'Games',participants:p.participants.map(x=>({...x,name:x.name+' (Games)'}))};
+assert.equal(compareMarkets(bet('Suma gemów',ou(20.5)),{...p,units:'Sets'},[total(20.5,0,777)],'tennis',Date.now(),[games]).length,1);
+assert.equal(compareMarkets(bet('Suma setów',ou(2.5)),{...p,units:'Sets'},[total(2.5,0,777)],'tennis',Date.now(),[games]).length,0);
+const special={...child,id:888,units:'Regular',special:{category:'Team Props',description:'Both Teams To Score?'},participants:[{id:88,name:'Yes',alignment:'neutral'},{id:89,name:'No',alignment:'neutral'}]};
+const yesNo={...market,matchupId:888,prices:[{participantId:89,price:-110},{participantId:88,price:-110}]};
+assert.equal(compareMarkets(bet('Oba zespoły strzelą gola',[{name:'Tak',odds:2.1},{name:'Nie',odds:1.7}]),p,[yesNo],'football',Date.now(),[special])[0].pick,'Tak');
+assert.equal(compareMarkets(bt,{...p,participants:p.participants.map(x=>({...x,name:'Other '+x.name}))},[total(165.5)],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(bet('Zwycięzca - Pierwsza Połowa',b.markets[0].selections),p,[{...market,period:1}],'basketball',Date.now()).length,0);
+assert.equal(compareMarkets(bet('Suma punktów (z wyłączeniem dogrywki)',ou(165.5)),p,[total(165.5)],'basketball',Date.now()).length,0);
+// Construct a protobuf hierarchy: each period must remain a separate leaf market.
+const {field,parseEvents}=require(path.join(target,'protocol.js'));
+const enc=(n,data)=>[...field(n,'').slice(0,-1),...(()=>{let x=data.length,a=[];do{a.push((x&127)|((x>>=7)?128:0));}while(x);return a;})(),...data];
+const sel=(name,odds,open=true)=>{const buf=Buffer.alloc(8);buf.writeDoubleLE(odds);return [...field(10,name),97,...buf,...field(14,open?1:2)];};
+const leaf=(name,pick)=>[...field(2,name),...field(3,name),...enc(16,sel(pick,2.1))];
+const parent=[...field(2,'Wynik meczu'),...field(9,3),...enc(13,leaf('1. połowa Wynik','A')),...enc(13,leaf('2. połowa Wynik','B'))];
+const fixture=enc(1,enc(1,[...field(1,123),...field(2,'A - B'),...enc(11,enc(3,parent))]));
+const parsed=parseEvents(new Uint8Array(fixture),true)[0];assert.equal(parsed.markets.length,2);assert.equal(parsed.markets[0].name,'1. połowa Wynik');assert.equal(parsed.markets[1].name,'2. połowa Wynik');
+console.log('PASS: EV, tax, exact lines, reversed sides, periods, units, linked corners, team totals, BTTS, push exclusion, hierarchy, freshness and ambiguity.');
+if(process.argv.includes('--live'))(async()=>{try{const result=await inventory('basketball',0);console.log(JSON.stringify({events:result.events,matched:result.matched,next:result.next}));if(result.pairs.length){const r=await scan('basketball',result.pairs.slice(0,2).map(p=>p.id));console.log(JSON.stringify({checked:r.checked,positive:r.rows.length,errors:r.errors,rows:r.rows.slice(0,2)}));}}catch(e){console.error('LIVE CHECK:',e.message);process.exitCode=1;}finally{fs.rmSync(target,{recursive:true,force:true});}})();else fs.rmSync(target,{recursive:true,force:true});

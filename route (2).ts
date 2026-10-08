@@ -1,0 +1,2 @@
+import { reference, sports } from '@/lib/radar';
+export async function GET(request: Request){try{const key=new URL(request.url).searchParams.get('sport');const sport=(await sports()).find(s=>s.key===key);if(!sport?.pinnacleId)return Response.json({error:'Brak źródła referencyjnego dla sportu'},{status:400});return Response.json(await reference(sport.pinnacleId));}catch(e){return Response.json({error:e instanceof Error?e.message:'Błąd Pinnacle'},{status:502});}}
